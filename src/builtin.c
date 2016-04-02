@@ -22,6 +22,7 @@ void *alloca (size_t);
 #endif
 #include <assert.h>
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #ifdef HAVE_ONIGURUMA
@@ -36,6 +37,7 @@ void *alloca (size_t);
 #include "linker.h"
 #include "locfile.h"
 #include "jv_unicode.h"
+#include "jv_alloc.h"
 
 
 static jv type_error(jv bad, const char* msg) {
@@ -1011,11 +1013,179 @@ static jv f_input(jq_state *jq, jv input) {
   void *data;
   jq_get_input_cb(jq, &cb, &data);
   if (cb == NULL)
-    return jv_invalid_with_msg(jv_string("break"));
-  jv v = cb(jq, data);
-  if (jv_is_valid(v) || jv_invalid_has_msg(jv_copy(v)))
-    return v;
-  return jv_invalid_with_msg(jv_string("break"));
+    return jv_invalid();
+  return cb(jq, data);
+}
+
+static jv f_inputs_step(jq_state *jq, cfunction_gen_state **state) {
+  jq_input_cb cb;
+  void *data;
+  jq_get_input_cb(jq, &cb, &data);
+  if (cb == NULL)
+    return jv_invalid();
+  return cb(jq, data);
+}
+
+static jv f_inputs(jq_state *jq, cfunction_gen_state **state, jv input) {
+  jv_free(input);
+  *state = NULL;
+  return f_inputs_step(jq, NULL);
+}
+
+struct f_explodes_state {
+  jv str;
+  const char *s;
+  const char *end;
+};
+
+static void f_explodes_reset(jq_state *jq, cfunction_gen_state *data) {
+  struct f_explodes_state *state = (void *)data;
+  if (state) {
+    jv_free(state->str);
+    free(state);
+  }
+}
+
+static jv f_explodes_step(jq_state *jq, cfunction_gen_state **data) {
+  struct f_explodes_state *state = *(void **)data;
+  assert(state != NULL);
+  if (state->s == state->end) {
+    f_explodes_reset(jq, *data);
+    *data = NULL;
+    return jv_invalid();
+  }
+
+  int c;
+  state->s = jvp_utf8_next(state->s, state->end, &c);
+  return jv_number(c);
+}
+
+static jv f_explodes(jq_state *jq, cfunction_gen_state **data, jv input) {
+  struct f_explodes_state *state;
+
+  if (jv_get_kind(input) != JV_KIND_STRING)
+    return type_error(input, "explodes inputs must be strings");
+
+  state = jv_mem_alloc(sizeof(*state));
+  state->str = jv_copy(input);
+  state->s = jv_string_value(input);
+  state->end = state->s + jv_string_length_bytes(jv_copy(input));
+  *data = (void *)state;
+  jv_free(input);
+  return f_explodes_step(jq, data);
+}
+
+static void f_popenr_reset(jq_state *jq, cfunction_gen_state *data) {
+  FILE *p = (void *)data;
+  if (p != NULL)
+    (void) pclose(p);
+}
+
+static jv f_popenr_step(jq_state *jq, cfunction_gen_state **state) {
+  FILE *p= *(void **)state;
+  assert(p != NULL);
+
+  jv out = jv_string("");
+  char buf[1024];
+  if (!ferror(p) && !feof(p)) {
+    while (fgets(buf, sizeof(buf), p) != NULL) {
+      char *newline = strchr(buf, '\n'); // XXX On Windows look for \r\n
+      if (newline != NULL) {
+        *newline = '\0';
+        out = jv_string_append_str(out, buf);
+        break;
+      }
+      out = jv_string_append_str(out, buf);
+    }
+  }
+  if (jv_string_length_bytes(jv_copy(out)) > 0)
+    return out;
+  assert(ferror(p) || feof(p));
+  int err = ferror(p);
+  int ret = pclose(p);
+  *state = NULL;
+  jv_free(out);
+  if (err)
+    return jv_invalid_with_msg(jv_string("error reading from pipe"));
+  if (ret != 0)
+    return jv_invalid_with_msg(jv_number(ret)); // EOF, child failed or died
+  return jv_invalid(); // EOF, child did exit(0)
+}
+
+static jv f_popenr(jq_state *jq, cfunction_gen_state **state, jv input) {
+  if (jv_get_kind(input) != JV_KIND_STRING)
+    return type_error(input, "popen inputs must be strings"); // XXX Add support for arrays (argv) too
+  FILE *p = popen(jv_string_value(input), "r");
+  if (p == NULL) {
+    jv out;
+    if (errno == ENOENT)
+      out = jv_invalid_with_msg(jv_string_fmt("No such file: %s", jv_string_value(input)));
+    else
+      out = jv_invalid_with_msg(jv_string_fmt("Error opening file %s: %s", jv_string_value(input), strerror(errno)));
+    jv_free(input);
+    return out;
+  }
+  jv_free(input);
+  *state = (void *)p;
+  return f_popenr_step(jq, state);
+}
+
+static void f_readfile_reset(jq_state *jq, cfunction_gen_state *state) {
+  FILE *f = (void *)state;
+  if (f)
+    (void) fclose(f);
+}
+
+static jv f_readfile_step(jq_state *jq, cfunction_gen_state **state) {
+  FILE *f = *(void **)state;
+  jv out;
+
+  assert(f != NULL);
+  out = jv_string("");
+  char buf[1024];
+  if (!ferror(f) && !feof(f)) {
+    while (fgets(buf, sizeof(buf), f) != NULL) {
+      char *newline = strchr(buf, '\n'); // XXX On Windows look for \r\n
+      if (newline != NULL) {
+        *newline = '\0';
+        out = jv_string_append_str(out, buf);
+        break;
+      }
+      out = jv_string_append_str(out, buf);
+    }
+  }
+  if (jv_string_length_bytes(jv_copy(out)) > 0)
+    return out;
+  assert(ferror(f) || feof(f));
+  int err = ferror(f);
+  int ret = fclose(f);
+  *state = NULL;
+  jv_free(out);
+  if (err)
+    return jv_invalid_with_msg(jv_string("error reading from file"));
+  if (ret != 0)
+    return jv_invalid_with_msg(jv_string("error closing file"));
+  return jv_invalid(); // EOF, child did exit(0)
+}
+
+static jv f_readfile(jq_state *jq, cfunction_gen_state **state, jv input) {
+  FILE *f;
+  jv out;
+
+  if (jv_get_kind(input) != JV_KIND_STRING)
+    return type_error(input, "readfile inputs must be strings");
+  f = fopen(jv_string_value(input), "r");
+  if (f == NULL) {
+    if (errno == ENOENT)
+      out = jv_invalid_with_msg(jv_string_fmt("No such file: %s", jv_string_value(input)));
+    else
+      out = jv_invalid_with_msg(jv_string_fmt("Error opening file %s: %s", jv_string_value(input), strerror(errno)));
+    jv_free(input);
+    return out;
+  }
+  *state = (void *)f;
+  jv_free(input);
+  return f_readfile_step(jq, state);
 }
 
 static jv f_debug(jq_state *jq, jv input) {
@@ -1318,7 +1488,11 @@ static const struct cfunction function_list[] = {
   {(cfunction_ptr)f_get_jq_origin, "get_jq_origin", 1},
   {(cfunction_ptr)f_match, "_match_impl", 4},
   {(cfunction_ptr)f_modulemeta, "modulemeta", 1},
-  {(cfunction_ptr)f_input, "_input", 1},
+  {(cfunction_ptr)f_input, "input", 1},
+  {(cfunction_ptr)f_inputs, "inputs", 1, f_inputs_step},
+  {(cfunction_ptr)f_readfile, "readfile", 1, f_readfile_step, f_readfile_reset},
+  {(cfunction_ptr)f_explodes, "explodes", 1, f_explodes_step, f_explodes_reset},
+  {(cfunction_ptr)f_popenr, "_popenr", 1, f_popenr_step, f_popenr_reset},
   {(cfunction_ptr)f_debug, "debug", 1},
   {(cfunction_ptr)f_stderr, "stderr", 1},
   {(cfunction_ptr)f_strptime, "strptime", 2},
