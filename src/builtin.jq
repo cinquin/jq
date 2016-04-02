@@ -19,6 +19,8 @@ def recurse(f; cond): def r: ., (f | select(cond) | r); r;
 def recurse: recurse(.[]?);
 def recurse_down: recurse;
 
+def implode(gen): [gen]|implode;
+
 def to_entries: [keys_unsorted[] as $k | {key: $k, value: .[$k]}];
 def from_entries: map({(.key // .Key // .name // .Name): (if has("value") then .value else .Value end)}) | add | .//={};
 def with_entries(f): to_entries | map(f) | from_entries;
@@ -195,12 +197,10 @@ def transpose:
 	        end;
 def in(xs): . as $x | xs | has($x);
 def inside(xs): . as $x | xs | contains($x);
-def input: _input;
 def repeat(exp):
      def _repeat:
          exp, _repeat;
      _repeat;
-def inputs: try repeat(_input) catch if .=="break" then empty else .|error end;
 # like ruby's downcase - only characters A to Z are affected
 def ascii_downcase:
   explode | map( if 65 <= . and . <= 90 then . + 32  else . end) | implode;
